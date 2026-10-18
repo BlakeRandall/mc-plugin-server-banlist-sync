@@ -1,0 +1,15 @@
+mongodb:
+  uri: "mongodb://bansync_user:CHANGE_ME@127.0.0.1:27017/?authSource=admin"
+  database: "minecraft"
+  collection: "shared_bans"
+  connect-timeout-ms: 5000
+  server-selection-timeout-ms: 5000
+
+server-id: ""
+sync-interval-seconds: 5
+mongo-batch-size: 1000
+apply-batch-size: 200
+startup-mode: "merge"
+verbose-logging: true
+sync-player-bans: true
+sync-ip-bans: true

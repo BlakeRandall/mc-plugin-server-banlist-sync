@@ -1,0 +1,15 @@
+name: BanSync
+version: 1.0.0
+main: dev.example.bansync.BanSyncPlugin
+api-version: '26.1'
+description: Synchronizes player UUID bans and IP bans across Paper servers through MongoDB, including unbans.
+author: BanSync
+commands:
+  bansync:
+    description: Manage BanSync
+    usage: /bansync <sync|status|reload>
+    permission: bansync.admin
+permissions:
+  bansync.admin:
+    description: Allows administration of BanSync.
+    default: op
