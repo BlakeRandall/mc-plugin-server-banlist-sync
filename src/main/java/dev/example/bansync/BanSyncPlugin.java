@@ -1,3 +1,4 @@
+
 package dev.example.bansync;
 
 import java.util.ArrayList;
@@ -12,12 +13,12 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 
-import org.bson.Document;
 import org.bukkit.BanEntry;
 import org.bukkit.BanList;
 import org.bukkit.Bukkit;
@@ -35,21 +36,27 @@ import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.BulkWriteOptions;
-import static com.mongodb.client.model.Filters.eq;
 import com.mongodb.client.model.IndexOptions;
 import com.mongodb.client.model.Indexes;
 import com.mongodb.client.model.UpdateOneModel;
 import com.mongodb.client.model.UpdateOptions;
+import com.mongodb.client.model.WriteModel;
+import org.bson.codecs.configuration.CodecRegistry;
+import org.bson.codecs.pojo.PojoCodecProvider;
+
+import static com.mongodb.client.model.Filters.eq;
 import static com.mongodb.client.model.Updates.combine;
 import static com.mongodb.client.model.Updates.currentDate;
 import static com.mongodb.client.model.Updates.inc;
 import static com.mongodb.client.model.Updates.set;
-import com.mongodb.client.model.WriteModel;
+import static com.mongodb.client.model.Updates.setOnInsert;
+import static org.bson.codecs.configuration.CodecRegistries.fromProviders;
+import static org.bson.codecs.configuration.CodecRegistries.fromRegistries;
 
 /**
  * Shared ban synchronization.
  *
- * All Bukkit ban-list reads and writes are performed on the main server thread.
+ * Bukkit ban-list reads and writes are performed on the main server thread.
  * MongoDB operations run on a dedicated single worker thread.
  *
  * Player bans use UUIDs as their canonical identity. IP bans use IP addresses.
@@ -58,6 +65,10 @@ import com.mongodb.client.model.WriteModel;
  */
 public final class BanSyncPlugin extends JavaPlugin {
 
+    /**
+     * Internal snapshot representation used for change detection.
+     * This is separate from the MongoDB BanEntry POJO.
+     */
     private record BanRecord(
             String key,
             String type,
@@ -66,8 +77,7 @@ public final class BanSyncPlugin extends JavaPlugin {
             String reason,
             String source,
             Long expiresAt
-            ) {
-
+    ) {
         String signature() {
             return type
                     + "|"
@@ -86,7 +96,7 @@ public final class BanSyncPlugin extends JavaPlugin {
 
     private volatile Map<String, String> lastAppliedSharedSnapshot;
     private volatile String lastError = "Not connected yet";
-    private volatile MongoCollection<Document> collection;
+    private volatile MongoCollection<BanEntry> collection;
 
     private MongoClient mongoClient;
     private ExecutorService databaseExecutor;
@@ -96,7 +106,7 @@ public final class BanSyncPlugin extends JavaPlugin {
     private int intervalSeconds;
     private boolean verbose;
     private String startupMode;
-    private boolean indexesReady;
+    private volatile boolean indexesReady;
     private int mongoBatchSize;
     private int applyBatchSize;
     private boolean syncPlayers;
@@ -137,13 +147,13 @@ public final class BanSyncPlugin extends JavaPlugin {
     }
 
     private String loadOrCreateServerId() {
-        String serverId = getConfig()
+        String configuredId = getConfig()
                 .getString("server-id", "")
                 .trim();
 
-        if (!serverId.isEmpty()) {
+        if (!configuredId.isEmpty()) {
             try {
-                return UUID.fromString(serverId).toString();
+                return UUID.fromString(configuredId).toString();
             } catch (IllegalArgumentException exception) {
                 getLogger().warning(
                         "Invalid server-id in config.yml; generating a new ID."
@@ -151,14 +161,14 @@ public final class BanSyncPlugin extends JavaPlugin {
             }
         }
 
-        serverId = UUID.randomUUID().toString();
+        String generatedId = UUID.randomUUID().toString();
 
-        getConfig().set("server-id", serverId);
+        getConfig().set("server-id", generatedId);
         saveConfig();
 
-        getLogger().info("Generated and saved server ID: " + serverId);
+        getLogger().info("Generated and saved server ID: " + generatedId);
 
-        return serverId;
+        return generatedId;
     }
 
     private void loadSettings() {
@@ -193,14 +203,15 @@ public final class BanSyncPlugin extends JavaPlugin {
         if (!startupMode.equals("merge")) {
             getLogger().warning(
                     "Unknown startup-mode '" + startupMode
-                    + "'; using merge."
+                            + "'; using merge."
             );
-
             startupMode = "merge";
         }
     }
 
     private void createMongoClient() {
+        MongoClient newClient = null;
+
         try {
             String uri = getConfig()
                     .getString("mongodb.uri", "")
@@ -212,14 +223,20 @@ public final class BanSyncPlugin extends JavaPlugin {
                 );
             }
 
-            if (mongoClient != null) {
-                mongoClient.close();
-            }
+            CodecRegistry pojoRegistry = fromRegistries(
+                    MongoClientSettings.getDefaultCodecRegistry(),
+                    fromProviders(
+                            PojoCodecProvider.builder()
+                                    .automatic(true)
+                                    .build()
+                    )
+            );
 
             MongoClientSettings settings = MongoClientSettings.builder()
                     .applyConnectionString(new ConnectionString(uri))
-                    .applyToSocketSettings(builder
-                            -> builder.connectTimeout(
+                    .codecRegistry(pojoRegistry)
+                    .applyToSocketSettings(builder ->
+                            builder.connectTimeout(
                                     Math.max(
                                             1000,
                                             getConfig().getInt(
@@ -230,8 +247,8 @@ public final class BanSyncPlugin extends JavaPlugin {
                                     TimeUnit.MILLISECONDS
                             )
                     )
-                    .applyToClusterSettings(builder
-                            -> builder.serverSelectionTimeout(
+                    .applyToClusterSettings(builder ->
+                            builder.serverSelectionTimeout(
                                     Math.max(
                                             1000,
                                             getConfig().getInt(
@@ -244,33 +261,47 @@ public final class BanSyncPlugin extends JavaPlugin {
                     )
                     .build();
 
-            mongoClient = MongoClients.create(settings);
+            newClient = MongoClients.create(settings);
 
-            MongoDatabase database = mongoClient.getDatabase(
+            MongoDatabase database = newClient.getDatabase(
                     getConfig().getString(
                             "mongodb.database",
                             "minecraft"
                     )
             );
 
-            collection = database.getCollection(
-                    getConfig().getString(
-                            "mongodb.collection",
-                            "shared_bans"
-                    )
-            );
+            MongoCollection<BanEntry> newCollection =
+                    database.getCollection(
+                            getConfig().getString(
+                                    "mongodb.collection",
+                                    "shared_bans"
+                            ),
+                            BanEntry.class
+                    );
 
+            MongoClient oldClient = mongoClient;
+
+            mongoClient = newClient;
+            collection = newCollection;
             indexesReady = false;
             lastError = null;
 
+            if (oldClient != null) {
+                oldClient.close();
+            }
         } catch (Exception exception) {
+            if (newClient != null && newClient != mongoClient) {
+                newClient.close();
+            }
+
             collection = null;
             lastError = exception.getMessage();
 
             getLogger().log(
                     Level.SEVERE,
                     "MongoDB configuration error: "
-                    + exception.getMessage()
+                            + exception.getMessage(),
+                    exception
             );
         }
     }
@@ -307,116 +338,112 @@ public final class BanSyncPlugin extends JavaPlugin {
             }
         }
 
+        // Capture Bukkit state on the main server thread.
         Map<String, BanRecord> localSnapshot = currentBans();
 
         Map<String, String> baseline = lastAppliedSharedSnapshot == null
                 ? null
                 : new HashMap<>(lastAppliedSharedSnapshot);
 
-        databaseExecutor.execute(() -> {
-            try {
-                MongoCollection<Document> coll = collection;
+        MongoCollection<BanEntry> coll = collection;
 
-                if (coll == null) {
-                    throw new IllegalStateException(
-                            "MongoDB collection is unavailable"
-                    );
-                }
+        try {
+            databaseExecutor.execute(() -> {
+                try {
+                    if (!indexesReady) {
+                        coll.createIndex(
+                                Indexes.ascending("key"),
+                                new IndexOptions()
+                                        .unique(true)
+                                        .name("unique_ban_key")
+                        );
 
-                if (!indexesReady) {
-                    coll.createIndex(
-                            Indexes.ascending("key"),
-                            new IndexOptions()
-                                    .unique(true)
-                                    .name("unique_ban_key")
-                    );
+                        coll.createIndex(
+                                Indexes.ascending("active"),
+                                new IndexOptions().name("active_lookup")
+                        );
 
-                    coll.createIndex(
-                            Indexes.ascending("active"),
-                            new IndexOptions().name("active_lookup")
-                    );
+                        indexesReady = true;
+                    }
 
-                    indexesReady = true;
-                }
+                    coll.find().limit(1).first();
 
-                coll.find().limit(1).first();
+                    if (baseline == null && startupMode.equals("merge")) {
+                        seedLocalBans(coll, localSnapshot);
+                    } else if (baseline != null) {
+                        Set<String> keys = new HashSet<>(baseline.keySet());
+                        keys.addAll(localSnapshot.keySet());
 
-                if (baseline == null && startupMode.equals("merge")) {
-                    seedLocalBans(coll, localSnapshot);
+                        for (String key : keys) {
+                            String previousSignature = baseline.get(key);
+                            BanRecord localRecord = localSnapshot.get(key);
 
-                } else if (baseline != null) {
-                    Set<String> keys = new HashSet<>(baseline.keySet());
-                    keys.addAll(localSnapshot.keySet());
+                            String currentSignature = localRecord == null
+                                    ? null
+                                    : localRecord.signature();
 
-                    for (String key : keys) {
-                        String previousSignature = baseline.get(key);
+                            if (Objects.equals(
+                                    previousSignature,
+                                    currentSignature
+                            )) {
+                                continue;
+                            }
 
-                        BanRecord localRecord = localSnapshot.get(key);
-
-                        String currentSignature = localRecord == null
-                                ? null
-                                : localRecord.signature();
-
-                        if (Objects.equals(
-                                previousSignature,
-                                currentSignature
-                        )) {
-                            continue;
-                        }
-
-                        if (localRecord == null) {
-                            publishTombstone(
-                                    coll,
-                                    key,
-                                    "local-change"
-                            );
-                        } else {
-                            publish(
-                                    coll,
-                                    localRecord,
-                                    true,
-                                    "local-change"
-                            );
+                            if (localRecord == null) {
+                                publishTombstone(
+                                        coll,
+                                        key,
+                                        "local-change"
+                                );
+                            } else {
+                                publish(
+                                        coll,
+                                        localRecord,
+                                        true,
+                                        "local-change"
+                                );
+                            }
                         }
                     }
+
+                    Map<String, BanRecord> sharedActive =
+                            fetchActiveBans(coll);
+
+                    Bukkit.getScheduler().runTask(this, () ->
+                            applySharedBans(sharedActive, () -> {
+                                Map<String, String> applied = new HashMap<>();
+
+                                sharedActive.forEach((key, record) ->
+                                        applied.put(key, record.signature())
+                                );
+
+                                lastAppliedSharedSnapshot = applied;
+                                lastSuccessfulSync.set(
+                                        System.currentTimeMillis()
+                                );
+
+                                lastError = null;
+                                cycleRunning.set(false);
+                            })
+                    );
+                } catch (Exception exception) {
+                    lastError = exception.getMessage();
+
+                    getLogger().log(
+                            Level.WARNING,
+                            "MongoDB sync failed; local bans were not "
+                                    + "reconciled. Will retry. Cause: "
+                                    + exception.getMessage(),
+                            exception
+                    );
+
+                    cycleRunning.set(false);
                 }
-
-                Map<String, BanRecord> sharedActive = fetchActiveBans(coll);
-
-                Bukkit.getScheduler().runTask(this, ()
-                        -> applySharedBans(sharedActive, () -> {
-                            Map<String, String> applied = new HashMap<>();
-
-                    sharedActive.forEach((key, record)
-                            -> applied.put(
-                                            key,
-                                            record.signature()
-                                    )
-                            );
-
-                            lastAppliedSharedSnapshot = applied;
-                            lastSuccessfulSync.set(
-                                    System.currentTimeMillis()
-                            );
-
-                            lastError = null;
-                            cycleRunning.set(false);
-                        })
-                );
-
-            } catch (Exception exception) {
-                lastError = exception.getMessage();
-
-                getLogger().log(
-                        Level.WARNING,
-                        "MongoDB sync failed; local bans were not "
-                        + "reconciled. Will retry. Cause: "
-                        + exception.getMessage()
-                );
-
-                cycleRunning.set(false);
-            }
-        });
+            });
+        } catch (RejectedExecutionException exception) {
+            lastError = "Database executor is shutting down";
+            cycleRunning.set(false);
+        }
     }
 
     @SuppressWarnings({"rawtypes", "unchecked"})
@@ -427,7 +454,7 @@ public final class BanSyncPlugin extends JavaPlugin {
             BanList list = Bukkit.getBanList(BanList.Type.NAME);
 
             for (Object object : list.getBanEntries()) {
-                BanEntry entry = (BanEntry) object;
+                org.bukkit.BanEntry entry = (org.bukkit.BanEntry) object;
 
                 String target = String.valueOf(entry.getTarget());
                 UUID uuid;
@@ -460,7 +487,7 @@ public final class BanSyncPlugin extends JavaPlugin {
             BanList list = Bukkit.getBanList(BanList.Type.IP);
 
             for (Object object : list.getBanEntries()) {
-                BanEntry entry = (BanEntry) object;
+                org.bukkit.BanEntry entry = (org.bukkit.BanEntry) object;
 
                 String target = String.valueOf(entry.getTarget());
                 String key = "IP:" + target;
@@ -484,7 +511,7 @@ public final class BanSyncPlugin extends JavaPlugin {
     }
 
     private void publish(
-            MongoCollection<Document> coll,
+            MongoCollection<BanEntry> coll,
             BanRecord record,
             boolean active,
             String source
@@ -500,8 +527,8 @@ public final class BanSyncPlugin extends JavaPlugin {
                         set(
                                 "expiresAt",
                                 record.expiresAt() == null
-                                ? null
-                                : new Date(record.expiresAt())
+                                        ? null
+                                        : new Date(record.expiresAt())
                         ),
                         set("active", active),
                         set("changedBy", serverId),
@@ -515,15 +542,15 @@ public final class BanSyncPlugin extends JavaPlugin {
         if (verbose) {
             getLogger().info(
                     "Published "
-                    + (active ? "ADD " : "REMOVE ")
-                    + record.key()
-                    + " to shared bans."
+                            + (active ? "ADD " : "REMOVE ")
+                            + record.key()
+                            + " to shared bans."
             );
         }
     }
 
     private void publishTombstone(
-            MongoCollection<Document> coll,
+            MongoCollection<BanEntry> coll,
             String key,
             String source
     ) {
@@ -547,17 +574,17 @@ public final class BanSyncPlugin extends JavaPlugin {
     }
 
     private Map<String, BanRecord> fetchActiveBans(
-            MongoCollection<Document> coll
+            MongoCollection<BanEntry> coll
     ) {
         Map<String, BanRecord> active = new HashMap<>();
         long now = System.currentTimeMillis();
 
-        for (Document document : coll.find(eq("active", true))
+        for (BanEntry entry : coll.find(eq("active", true))
                 .batchSize(mongoBatchSize)) {
 
-            String key = document.getString("key");
-            String type = document.getString("type");
-            String target = document.getString("target");
+            String key = entry.getKey();
+            String type = entry.getType();
+            String target = entry.getTarget();
 
             if (key == null || type == null || target == null) {
                 continue;
@@ -566,7 +593,7 @@ public final class BanSyncPlugin extends JavaPlugin {
             if (!type.equals("PLAYER") && !type.equals("IP")) {
                 getLogger().warning(
                         "Ignoring unknown ban type in MongoDB: "
-                        + type + " (" + key + ")"
+                                + type + " (" + key + ")"
                 );
                 continue;
             }
@@ -579,14 +606,14 @@ public final class BanSyncPlugin extends JavaPlugin {
                 continue;
             }
 
-            Date expiration = document.getDate("expiresAt");
+            Date expiration = entry.getExpiresAt();
 
             if (expiration != null && expiration.getTime() <= now) {
                 publishTombstone(coll, key, "expired");
                 continue;
             }
 
-            String uuid = nullToEmpty(document.getString("uuid"));
+            String uuid = nullToEmpty(entry.getUuid());
 
             if (type.equals("PLAYER")) {
                 try {
@@ -595,7 +622,7 @@ public final class BanSyncPlugin extends JavaPlugin {
                     if (!key.equals("PLAYER:" + parsedUuid)) {
                         getLogger().warning(
                                 "Ignoring inconsistent player-ban key: "
-                                + key
+                                        + key
                         );
                         continue;
                     }
@@ -614,8 +641,8 @@ public final class BanSyncPlugin extends JavaPlugin {
                             type,
                             target,
                             uuid,
-                            nullToEmpty(document.getString("reason")),
-                            nullToEmpty(document.getString("source")),
+                            nullToEmpty(entry.getReason()),
+                            nullToEmpty(entry.getSource()),
                             millis(expiration)
                     )
             );
@@ -665,14 +692,14 @@ public final class BanSyncPlugin extends JavaPlugin {
             operations.add(() -> removeBan(key));
         }
 
-        applyBatch(operations, 0, onSuccess);
-
         getLogger().info(
                 "Ban reconciliation queued: add/update="
-                + toAddOrUpdate.size()
-                + ", remove="
-                + toRemove.size()
+                        + toAddOrUpdate.size()
+                        + ", remove="
+                        + toRemove.size()
         );
+
+        applyBatch(operations, 0, onSuccess);
     }
 
     private void applyBan(BanRecord record) {
@@ -684,7 +711,6 @@ public final class BanSyncPlugin extends JavaPlugin {
             UUID uuid = UUID.fromString(record.uuid());
 
             OfflinePlayer player = Bukkit.getOfflinePlayer(uuid);
-
             String name = player.getName();
 
             if (name == null || name.isBlank()) {
@@ -702,7 +728,6 @@ public final class BanSyncPlugin extends JavaPlugin {
                     expiration,
                     emptyToNull(record.source())
             );
-
         } else if (record.type().equals("IP") && syncIps) {
             BanList list = Bukkit.getBanList(BanList.Type.IP);
 
@@ -734,7 +759,7 @@ public final class BanSyncPlugin extends JavaPlugin {
             } catch (IllegalArgumentException exception) {
                 getLogger().warning(
                         "Cannot remove player ban with malformed UUID: "
-                        + key
+                                + key
                 );
                 return;
             }
@@ -743,7 +768,6 @@ public final class BanSyncPlugin extends JavaPlugin {
 
             list.pardon(name);
             list.pardon(uuid);
-
         } else if (key.startsWith("IP:") && syncIps) {
             String ip = key.substring("IP:".length());
 
@@ -778,7 +802,6 @@ public final class BanSyncPlugin extends JavaPlugin {
             } else {
                 onSuccess.run();
             }
-
         } catch (Exception exception) {
             lastError = exception.getMessage();
             cycleRunning.set(false);
@@ -792,33 +815,37 @@ public final class BanSyncPlugin extends JavaPlugin {
     }
 
     private void seedLocalBans(
-            MongoCollection<Document> coll,
+            MongoCollection<BanEntry> coll,
             Map<String, BanRecord> localSnapshot
     ) {
-        List<WriteModel<Document>> batch = new ArrayList<>(mongoBatchSize);
+        List<WriteModel<BanEntry>> batch =
+                new ArrayList<>(mongoBatchSize);
 
         for (BanRecord record : localSnapshot.values()) {
-            Document seed = new Document("key", record.key())
-                    .append("type", record.type())
-                    .append("target", record.target())
-                    .append("uuid", record.uuid())
-                    .append("reason", record.reason())
-                    .append("source", record.source())
-                    .append(
-                            "expiresAt",
-                            record.expiresAt() == null
-                            ? null
-                            : new Date(record.expiresAt())
-                    )
-                    .append("active", true)
-                    .append("changedBy", serverId)
-                    .append("changeSource", "startup-merge")
-                    .append("updatedAt", new Date())
-                    .append("revision", 1L);
-
             batch.add(new UpdateOneModel<>(
                     eq("key", record.key()),
-                    new Document("$setOnInsert", seed),
+                    combine(
+                            setOnInsert("key", record.key()),
+                            setOnInsert("type", record.type()),
+                            setOnInsert("target", record.target()),
+                            setOnInsert("uuid", record.uuid()),
+                            setOnInsert("reason", record.reason()),
+                            setOnInsert("source", record.source()),
+                            setOnInsert(
+                                    "expiresAt",
+                                    record.expiresAt() == null
+                                            ? null
+                                            : new Date(record.expiresAt())
+                            ),
+                            setOnInsert("active", true),
+                            setOnInsert("changedBy", serverId),
+                            setOnInsert(
+                                    "changeSource",
+                                    "startup-merge"
+                            ),
+                            setOnInsert("updatedAt", new Date()),
+                            setOnInsert("revision", 1L)
+                    ),
                     new UpdateOptions().upsert(true)
             ));
 
@@ -827,7 +854,6 @@ public final class BanSyncPlugin extends JavaPlugin {
                         batch,
                         new BulkWriteOptions().ordered(false)
                 );
-
                 batch.clear();
             }
         }
@@ -862,7 +888,7 @@ public final class BanSyncPlugin extends JavaPlugin {
         String age = last == 0L
                 ? "never"
                 : ((System.currentTimeMillis() - last) / 1000L)
-                + "s ago";
+                        + "s ago";
 
         return "last-success="
                 + age
@@ -897,10 +923,9 @@ public final class BanSyncPlugin extends JavaPlugin {
                 : args[0].toLowerCase(Locale.ROOT);
 
         switch (subcommand) {
-            case "status" ->
-                sender.sendMessage(
-                        "BanSync: " + statusText()
-                );
+            case "status" -> sender.sendMessage(
+                    "BanSync: " + statusText()
+            );
 
             case "sync" -> {
                 if (cycleRunning.get()) {
@@ -912,7 +937,6 @@ public final class BanSyncPlugin extends JavaPlugin {
                             this,
                             this::beginSync
                     );
-
                     sender.sendMessage("BanSync: sync queued.");
                 }
             }
@@ -921,7 +945,7 @@ public final class BanSyncPlugin extends JavaPlugin {
                 if (cycleRunning.get()) {
                     sender.sendMessage(
                             "BanSync: wait for the current sync "
-                            + "to finish before reloading."
+                                    + "to finish before reloading."
                     );
                     return true;
                 }
@@ -933,15 +957,14 @@ public final class BanSyncPlugin extends JavaPlugin {
 
                 sender.sendMessage(
                         "BanSync: configuration reloaded; "
-                        + "database configuration valid: "
-                        + (collection != null)
+                                + "database configuration valid: "
+                                + (collection != null)
                 );
             }
 
-            default ->
-                sender.sendMessage(
-                        "Usage: /bansync <sync|status|reload>"
-                );
+            default -> sender.sendMessage(
+                    "Usage: /bansync <sync|status|reload>"
+            );
         }
 
         return true;
