@@ -6,7 +6,7 @@ import java.util.Date;
 /**
  * POJO representing a shared ban document in MongoDB.
  */
-public class BanEntry {
+public class SharedBanEntry {
 
     private String key;
     private String type;
@@ -22,7 +22,7 @@ public class BanEntry {
     private Date updatedAt;
     private long revision;
 
-    public BanEntry() {
+    public SharedBanEntry() {
         // Required by the MongoDB POJO codec.
     }
 
