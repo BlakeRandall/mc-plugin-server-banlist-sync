@@ -1,0 +1,151 @@
+
+name: Default Workflow
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "*"
+    tags:
+      - "*"
+  pull_request:
+    branches:
+      - "*"
+
+permissions:
+  contents: write
+
+jobs:
+  checks:
+    name: Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set Up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set Up Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Generate Gradle Wrapper
+        run: gradle wrapper
+
+      - name: Pre-Check
+        uses: pre-commit/action@v3.0.1
+
+      - name: Gradle Tests
+        run: ./gradlew --no-daemon test
+
+  release:
+    name: Create Release
+    if: github.ref_type == 'tag'
+    needs: checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          draft: false
+          prerelease: true
+
+  build:
+    name: Build JAR
+    needs:
+      - checks
+      - release
+    if: >-
+      always() &&
+      needs.checks.result == 'success' &&
+      (needs.release.result == 'success' || needs.release.result == 'skipped')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set Up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set Up Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Generate Gradle Wrapper
+        run: gradle wrapper
+
+      - name: Build JAR
+        run: ./gradlew --no-daemon clean jar
+
+      - name: Package JAR
+        id: package
+        shell: bash
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+
+      - name: Package JAR
+        id: package
+        shell: bash
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+
+          shopt -s nullglob
+          jars=()
+
+          for jar in build/libs/*.jar; do
+            [[ "$jar" == *-plain.jar ]] && continue
+            jars+=("$jar")
+          done
+
+          if [ ${#jars[@]} -eq 0 ]; then
+            echo "No dependency-inclusive JAR found in build/libs/"
+            exit 1
+          fi
+
+          if [ ${#jars[@]} -gt 1 ]; then
+            echo "Multiple dependency-inclusive JARs found:"
+            printf '%s\n' "${jars[@]}"
+            exit 1
+          fi
+
+          VERSION="${REF_NAME//\//-}"
+          JAR_NAME="BanSync-${VERSION}.jar"
+
+          cp "${jars[0]}" "dist/${JAR_NAME}"
+
+          cd dist
+          sha256sum "${JAR_NAME}" > "${JAR_NAME}.sha256"
+
+          echo "jar=${JAR_NAME}" >> "$GITHUB_OUTPUT"
+          echo "jar_path=dist/${JAR_NAME}" >> "$GITHUB_OUTPUT"
+          echo "checksum_path=dist/${JAR_NAME}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload CI Artifact
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          path: ${{ steps.package.outputs.jar_path }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload Release Assets
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: true
+          files: |
+            ${{ steps.package.outputs.jar_path }}
+            ${{ steps.package.outputs.checksum_path }}
