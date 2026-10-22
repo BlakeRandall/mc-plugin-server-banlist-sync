@@ -1,5 +1,5 @@
 name: BanSync
-version: 1.0.0
+version: "${version}"
 main: dev.example.bansync.BanSyncPlugin
 api-version: '26.1'
 description: Synchronizes player UUID bans and IP bans across Paper servers through MongoDB, including unbans.
