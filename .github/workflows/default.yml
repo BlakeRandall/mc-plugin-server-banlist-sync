@@ -82,7 +82,7 @@ jobs:
         run: gradle wrapper
 
       - name: Build JAR
-        run: ./gradlew --no-daemon clean jar
+        run: ./gradlew --no-daemon clean shadowJar
 
       - name: Package JAR
         id: package
