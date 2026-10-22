@@ -90,13 +90,6 @@ jobs:
         env:
           REF_NAME: ${{ github.ref_name }}
         run: |
-
-      - name: Package JAR
-        id: package
-        shell: bash
-        env:
-          REF_NAME: ${{ github.ref_name }}
-        run: |
           set -euo pipefail
 
           mkdir -p dist
